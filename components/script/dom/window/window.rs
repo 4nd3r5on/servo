@@ -118,6 +118,9 @@ use crate::dom::bindings::codegen::Bindings::DocumentBinding::{
 };
 use crate::dom::bindings::codegen::Bindings::HTMLIFrameElementBinding::HTMLIFrameElementMethods;
 use crate::dom::bindings::codegen::Bindings::HistoryBinding::History_Binding::HistoryMethods;
+use crate::dom::bindings::codegen::Bindings::IdleDeadlineBinding::{
+    IdleRequestCallback, IdleRequestOptions,
+};
 use crate::dom::bindings::codegen::Bindings::ImageBitmapBinding::{
     ImageBitmapOptions, ImageBitmapSource,
 };
@@ -318,6 +321,8 @@ pub(crate) struct Window {
     performance: MutNullableDom<Performance>,
     #[no_trace]
     navigation_start: Cell<CrossProcessInstant>,
+    /// <https://w3c.github.io/requestidlecallback/#dfn-idle-callback-identifier>
+    idle_callback_identifier: Cell<u32>,
     screen: MutNullableDom<Screen>,
     session_storage: MutNullableDom<Storage>,
     local_storage: MutNullableDom<Storage>,
@@ -1924,6 +1929,23 @@ impl WindowMethods<crate::DomTypeHolder> for Window {
         let doc = self.Document();
         doc.cancel_animation_frame(ident);
         Ok(())
+    }
+
+    /// <https://w3c.github.io/requestidlecallback/#dom-window-requestidlecallback>
+    fn RequestIdleCallback(
+        &self,
+        _callback: RootedCallback<IdleRequestCallback>,
+        _options: &IdleRequestOptions,
+    ) -> u32 {
+        // TODO: Store and invoke the callback once idle periods are implemented.
+        let handle = self.idle_callback_identifier.get().wrapping_add(1);
+        self.idle_callback_identifier.set(handle);
+        handle
+    }
+
+    /// <https://w3c.github.io/requestidlecallback/#dom-window-cancelidlecallback>
+    fn CancelIdleCallback(&self, _handle: u32) {
+        // TODO: Remove the callback once idle callbacks are stored.
     }
 
     /// <https://html.spec.whatwg.org/multipage/#dom-window-postmessage>
@@ -4193,6 +4215,7 @@ impl Window {
             document: Default::default(),
             performance: Default::default(),
             navigation_start: Cell::new(navigation_start),
+            idle_callback_identifier: Cell::new(0),
             screen: Default::default(),
             session_storage: Default::default(),
             local_storage: Default::default(),

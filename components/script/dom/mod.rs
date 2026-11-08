@@ -276,6 +276,7 @@ pub(crate) use self::geometry::*;
 pub(crate) mod globalscope;
 pub(crate) use self::globalscope::*;
 pub(crate) mod html;
+pub(crate) mod idledeadline;
 pub(crate) use self::html::*;
 pub(crate) mod indexeddb;
 pub(crate) use self::indexeddb::*;
