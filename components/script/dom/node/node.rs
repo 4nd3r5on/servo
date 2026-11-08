@@ -202,7 +202,11 @@ bitflags! {
         /// animating image. This flag is never cleared once it is set.
         const HAS_EVER_ANIMATED = 1 << 3;
 
-        // There are two free bits here.
+        // There is one free bit here.
+
+        /// Whether the style declarations mapped from attributes (presentational hints)
+        /// have been resolved already and are up-to-date.
+        const HAS_RESOLVED_PRESENTATIONAL_HINTS = 1 << 5;
 
         /// Specifies whether the parser has set an associated form owner for
         /// this element. Only applicable for form-associatable elements.
@@ -379,10 +383,26 @@ impl Node {
 
             match operation {
                 MoveOrInsert::Move => {
-                    if (parent_is_in_a_document_tree || parent_in_shadow_tree) &&
-                        let Some(element) = node.downcast::<Element>()
-                    {
-                        element.register_current_id_and_name_attribute(cx);
+                    if let Some(element) = node.downcast::<Element>() {
+                        if parent_is_in_a_document_tree || parent_in_shadow_tree {
+                            element.register_current_id_and_name_attribute(cx);
+                        }
+
+                        // Shadow-including descendants of this node's shadow root were marked as
+                        // disconnected in the first phase of the move, so they have to be marked as
+                        // connected as it finishes. This mirrors what happens in
+                        // `ShadowRoot::bind_to_tree`, but only handling the IS_CONNECTED flag.
+                        if parent_is_connected && let Some(shadow_root) = element.shadow_root() {
+                            for node in shadow_root
+                                .upcast::<Node>()
+                                .traverse_preorder_unrooted(cx.no_gc(), ShadowIncluding::Yes)
+                            {
+                                node.set_flag(NodeFlags::IS_CONNECTED, true);
+                                // This node should never have been marked as dirty, because it
+                                // wasn't flagged as connected.
+                                debug_assert!(!node.get_flag(NodeFlags::HAS_DIRTY_DESCENDANTS));
+                            }
+                        }
                     }
                 },
                 MoveOrInsert::Insert => vtable_for(&node).bind_to_tree(cx, &context),
@@ -497,12 +517,7 @@ impl Node {
         for node in root.traverse_preorder(ShadowIncluding::No) {
             let node_was_in_tree = node.is_in_a_document_tree() || node.is_in_a_shadow_tree();
 
-            // Moving can never change the shadow-including root of a node, so IS_CONNECTED will
-            // maintain the value that it had before the move.
-            node.set_flag(
-                (RESET_FLAGS - NodeFlags::IS_CONNECTED) | NodeFlags::IS_IN_SHADOW_TREE,
-                false,
-            );
+            node.set_flag(RESET_FLAGS | NodeFlags::IS_IN_SHADOW_TREE, false);
             document.clean_up_style_and_layout_data_for_node(&node);
 
             // Unregister the `id` and `name` attributes for this node. Note that they
@@ -529,7 +544,7 @@ impl Node {
                 {
                     // Moving can never change the shadow-including root of a node, so IS_CONNECTED
                     // will maintain the value that it had before the move.
-                    node.set_flag(RESET_FLAGS - NodeFlags::IS_CONNECTED, false);
+                    node.set_flag(RESET_FLAGS, false);
                     document.clean_up_style_and_layout_data_for_node(&node);
                 }
             }
@@ -945,10 +960,9 @@ impl Node {
                 // For content changes in text nodes, we should accurately use
                 // [`NodeDamage::ContentOrHeritage`] to mark the parent node, thereby
                 // reducing the scope of incremental box tree construction.
-                self.parent_node
-                    .get()
-                    .unwrap()
-                    .dirty(no_gc, NodeDamage::ContentOrHeritage);
+                if let Some(parent) = self.parent_node.get() {
+                    parent.dirty(no_gc, NodeDamage::ContentOrHeritage);
+                }
 
                 if damage == NodeDamage::Other {
                     self.add_pending_accessibility_damage(no_gc, AccessibilityDamage::Node);
@@ -1251,8 +1265,8 @@ impl Node {
         window.scrolling_area_query(cx, Some(self))
     }
 
-    pub(crate) fn effective_overflow(&self) -> Option<AxesOverflow> {
-        self.owner_window().query_effective_overflow(self)
+    pub(crate) fn effective_overflow(&self, cx: &mut JSContext) -> Option<AxesOverflow> {
+        self.owner_window().query_effective_overflow(cx, self)
     }
 
     pub(crate) fn effective_overflow_without_reflow(&self) -> Option<AxesOverflow> {
@@ -2766,7 +2780,7 @@ impl Node {
                 node.children_unrooted(cx.no_gc())
                     .map(|node| Dom::from_ref(&**node)),
             );
-            new_nodes.r()
+            new_nodes.as_ref_slice()
         } else {
             from_ref(&node)
         };
@@ -3028,7 +3042,7 @@ impl Node {
         let added_nodes = if let Some(node) = node.as_ref() {
             if let NodeTypeId::DocumentFragment(_) = node.type_id() {
                 added_nodes.extend(node.children().map(|child| Dom::from_ref(&*child)));
-                added_nodes.r()
+                added_nodes.as_ref_slice()
             } else {
                 from_ref(node)
             }
@@ -3053,7 +3067,7 @@ impl Node {
         if !removed_nodes.is_empty() || !added_nodes.is_empty() {
             let mutation = LazyCell::new(|| Mutation::ChildList {
                 added: Some(added_nodes),
-                removed: Some(removed_nodes.r()),
+                removed: Some(removed_nodes.as_ref_slice()),
                 prev: None,
                 next: None,
             });
@@ -3995,7 +4009,7 @@ impl NodeMethods<crate::DomTypeHolder> for Node {
             node.type_id() == NodeTypeId::DocumentFragment(DocumentFragmentTypeId::ShadowRoot)
         {
             nodes.extend(node.children().map(|node| Dom::from_ref(&*node)));
-            nodes.r()
+            nodes.as_ref_slice()
         } else {
             from_ref(&node)
         };

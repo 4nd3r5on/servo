@@ -45,7 +45,7 @@ use script_bindings::reflector::DomObject;
 use selectors::attr::CaseSensitivity;
 use selectors::matching::ElementSelectorFlags;
 use selectors::sink::Push;
-use servo_arc::Arc as ServoArc;
+use servo_arc::{Arc as ServoArc, ArcBorrow as ServoArcBorrow};
 use style::applicable_declarations::ApplicableDeclarationBlock;
 use style::attr::{AttrValue, LengthOrPercentageOrAuto};
 use style::context::QuirksMode;
@@ -57,7 +57,7 @@ use style::properties::{
     ComputedValues, Importance, PropertyDeclaration, PropertyDeclarationBlock,
     parse_style_attribute,
 };
-use style::rule_tree::{CascadeLevel, CascadeOrigin};
+use style::rule_tree::{CascadeLevel, CascadeOrigin, StyleSourceBorrow};
 use style::selector_parser::{RestyleDamage, SelectorParser, Snapshot};
 use style::shared_lock::Locked;
 use style::str::string_as_ascii_lowercase;
@@ -124,6 +124,7 @@ use crate::dom::customelementregistry::{
     CustomElementState, is_valid_custom_element_name,
 };
 use crate::dom::document::Document;
+use crate::dom::document::focus::FocusableArea;
 use crate::dom::documentfragment::DocumentFragment;
 use crate::dom::domrect::DOMRect;
 use crate::dom::domrectlist::DOMRectList;
@@ -607,10 +608,10 @@ impl Element {
 
     /// Whether this element is styled such that it establishes a scroll container.
     /// <https://www.w3.org/TR/css-overflow-3/#scroll-container>
-    pub(crate) fn establishes_scroll_container(&self) -> bool {
+    pub(crate) fn establishes_scroll_container(&self, cx: &mut JSContext) -> bool {
         // The CSS computed value has made sure that either both axes are scrollable or none are scrollable.
         self.upcast::<Node>()
-            .effective_overflow()
+            .effective_overflow(cx)
             .is_some_and(|overflow| overflow.establishes_scroll_container())
     }
 
@@ -633,7 +634,7 @@ impl Element {
     ///  2. The style specifies that overflow should be scrollable (`auto`, `hidden` or `scroll`).
     ///  3. The fragment actually has content that overflows the box.
     fn has_scrolling_box(&self, cx: &mut JSContext) -> bool {
-        self.has_css_layout_box() && self.establishes_scroll_container() && self.has_overflow(cx)
+        self.has_css_layout_box() && self.establishes_scroll_container(cx) && self.has_overflow(cx)
     }
 
     pub(crate) fn shadow_root(&self) -> Option<DomRoot<ShadowRoot>> {
@@ -1097,6 +1098,12 @@ impl Element {
         let mut pseudo_styles = data.styles.pseudos.as_array().iter();
         pseudo_styles.any(|style| style.as_deref().is_some_and(&check_styles_fn))
     }
+
+    #[inline]
+    pub(crate) fn dirty_presentational_hints(&self) {
+        self.upcast::<Node>()
+            .set_flag(NodeFlags::HAS_RESOLVED_PRESENTATIONAL_HINTS, false);
+    }
 }
 
 /// <https://dom.spec.whatwg.org/#valid-shadow-host-name>
@@ -1239,6 +1246,29 @@ impl<'dom> LayoutDom<'dom, Element> {
     }
 
     #[inline]
+    #[expect(unsafe_code)]
+    pub(crate) fn presentational_hints(
+        self,
+    ) -> Option<&'dom ServoArc<Locked<PropertyDeclarationBlock>>> {
+        unsafe { self.unsafe_get().attrs.borrow_for_layout() }.presentational_hints()
+    }
+
+    #[inline]
+    #[expect(unsafe_code)]
+    pub(crate) fn ensure_presentational_hints(self) {
+        let node = self.upcast::<Node>();
+        if unsafe { node.get_flag(NodeFlags::HAS_RESOLVED_PRESENTATIONAL_HINTS) } {
+            return;
+        }
+        self.unsafe_get()
+            .attrs
+            .set_presentational_hints(self.compute_presentational_hints());
+        unsafe {
+            node.set_flag(NodeFlags::HAS_RESOLVED_PRESENTATIONAL_HINTS, true);
+        }
+    }
+
+    #[inline]
     fn apply_property_for_length_percentage<Callback>(
         self,
         length_percentage: LengthOrPercentageOrAuto,
@@ -1263,10 +1293,7 @@ impl<'dom> LayoutDom<'dom, Element> {
         }
     }
 
-    pub(crate) fn synthesize_presentational_hints_for_legacy_attributes<V>(self, hints: &mut V)
-    where
-        V: Push<ApplicableDeclarationBlock>,
-    {
+    fn compute_presentational_hints(&self) -> Option<ServoArc<Locked<PropertyDeclarationBlock>>> {
         // TODO: Move HTML presentational hints handling into
         // HTMLElement::synthesize_presentational_hints_for_legacy_attributes
         let document = self.upcast::<Node>().owner_doc_for_layout();
@@ -1616,16 +1643,35 @@ impl<'dom> LayoutDom<'dom, Element> {
             }
         }
 
-        let Some(property_declaration_block) = property_declaration_block else {
-            return;
-        };
+        let property_declaration_block = property_declaration_block?;
 
         let shared_lock = &document.shared_style_locks().author;
-        hints.push(ApplicableDeclarationBlock::from_declarations(
-            ServoArc::new(shared_lock.wrap(property_declaration_block)),
-            CascadeLevel::new(CascadeOrigin::PresHints),
-            LayerOrder::root(),
-        ));
+        Some(ServoArc::new(shared_lock.wrap(property_declaration_block)))
+    }
+
+    #[expect(unsafe_code)]
+    pub(crate) fn synthesize_presentational_hints_for_legacy_attributes<'a, V>(self, hints: &mut V)
+    where
+        V: Push<ApplicableDeclarationBlock<'a>>,
+    {
+        debug_assert!(
+            self.style_data().is_none() ||
+                unsafe {
+                    self.upcast::<Node>()
+                        .get_flag(NodeFlags::HAS_RESOLVED_PRESENTATIONAL_HINTS)
+                }
+        );
+        self.ensure_presentational_hints();
+        if let Some(declarations) = self.presentational_hints() {
+            // Safety: The declarations must outlive `'a`. That's the case for the presentational hints
+            // above, which are owned by the element, and which can't change while we're matching.
+            let declarations = unsafe { ServoArcBorrow::from_ref(&*(&**declarations as *const _)) };
+            hints.push(ApplicableDeclarationBlock::from_declarations(
+                StyleSourceBorrow::from_declarations(declarations),
+                CascadeLevel::new(CascadeOrigin::PresHints),
+                LayerOrder::root(),
+            ));
+        }
     }
 
     pub(crate) fn get_span(self) -> Option<u32> {
@@ -2130,7 +2176,7 @@ impl Element {
         let mutation = LazyCell::new(|| Mutation::Attribute {
             name: name.clone(),
             namespace: namespace.clone(),
-            old_value: old_value.map(|old_value| DOMString::from(&**old_value)),
+            old_value,
         });
         MutationObserver::queue_a_mutation_record(cx, &self.node, mutation);
 
@@ -5055,12 +5101,52 @@ impl VirtualMethods for Element {
     fn unbind_from_tree(&self, cx: &mut JSContext, context: &UnbindContext) {
         self.super_type().unwrap().unbind_from_tree(cx, context);
 
-        if let Some(f) = self.as_maybe_form_control() {
+        // These are the node removal steps from:
+        // <https://html.spec.whatwg.org/multipage/#dom-trees:concept-node-remove-ext>.
+        // In practice, they only apply to elements. Putting the steps here avoids work
+        // that doesn't need to happen when non-Element nodes are moved from the tree.
+        //
+        // 1. Let document be removedNode's node document.
+        let document = self.owner_document_unrooted(cx.no_gc());
+
+        // 2. If document's focused area is removedNode, then set document's focused area to
+        // document's viewport, and set document's relevant global object's navigation API's focus
+        // changed during ongoing navigation to false.
+        //
+        // We are not calling the focusing steps on purpose here. There is a note about this in
+        // the specification that reads:
+        //
+        // > This does not perform the unfocusing steps, focusing steps, or focus update steps, and
+        // > thus no blur or change events are fired.
+        if document
+            .focus_handler()
+            .focused_area()
+            .element()
+            .is_some_and(|focused_element| focused_element == self)
+        {
+            document
+                .focus_handler()
+                .set_focused_area(cx.no_gc(), FocusableArea::Viewport);
+        }
+
+        // 3. If removedNode is an element whose namespace is the HTML namespace, and this standard
+        // defines HTML element removing steps for removedNode's local name, then run the
+        // corresponding HTML element removing steps given removedNode, isSubtreeRoot, and
+        // oldAncestor.
+        //
+        // Note: These steps live in each subclass, which has already called into this code.
+
+        // 4. If removedNode is a form-associated element with a non-null form owner and removedNode
+        // and its form owner are no longer in the same tree, then reset the form owner of
+        // removedNode.
+        if let Some(form_control) = self.as_maybe_form_control() {
             // TODO: The valid state of ancestors might be wrong if the form control element
             // has a fieldset ancestor, for instance: `<form><fieldset><input>`,
             // if `<input>` is unbound, `<form><fieldset>` should trigger a call to `update_validity()`.
-            f.unbind_form_control_from_tree(cx);
+            form_control.unbind_form_control_from_tree(cx);
         }
+
+        self.dirty_presentational_hints();
 
         if !context.tree_is_in_a_document_tree && !context.tree_is_in_a_shadow_tree {
             return;
